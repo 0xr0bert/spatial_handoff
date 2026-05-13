@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::thread;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
+use tokio::time::interval;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Agent {
@@ -17,7 +20,8 @@ struct NodeConfig {
     boundary_max: f64,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         println!("Usage: cargo run -- [a|b]");
@@ -43,13 +47,28 @@ fn main() {
         _ => panic!("Invalid node name"),
     };
 
-    // Bind UDP socket and set it to non-blocking so sim loop doesn't freeze
-    let socket = std::net::UdpSocket::bind(format!("127.0.0.1:{}", config.port))
-        .expect("Failed to bind socket");
+    // Bind UDP socket and wrap it in an Arc so it can be shared safely
+    let socket = Arc::new(
+        UdpSocket::bind(format!("127.0.0.1:{}", config.port))
+            .await
+            .expect("Failed to bind socket"),
+    );
 
-    socket
-        .set_nonblocking(true)
-        .expect("Failed to set socket to non-blocking");
+    // Create a channel to send handoff packets
+    let (handoff_tx, mut handoff_rx) = mpsc::channel::<Agent>(100);
+
+    // Network listener
+    let listener_socket = Arc::clone(&socket);
+    tokio::spawn(async move {
+        let mut buffer = [0u8; 512];
+        loop {
+            if let Ok((size, _)) = listener_socket.recv_from(&mut buffer).await {
+                if let Ok(incoming_agent) = serde_json::from_slice::<Agent>(&buffer[..size]) {
+                    let _ = handoff_tx.send(incoming_agent).await;
+                }
+            }
+        }
+    });
 
     let mut local_agents: Vec<Agent> = Vec::new();
 
@@ -69,22 +88,20 @@ fn main() {
         local_agents.len()
     );
 
-    let mut buffer = [0u8; 512];
+    let mut tick_int = interval(Duration::from_secs(1));
 
     // core loop
     loop {
-        // process incoming packets
-        while let Ok((size, _)) = socket.recv_from(&mut buffer) {
-            if let Ok(incoming_agent) = serde_json::from_slice::<Agent>(&buffer[..size]) {
-                println!(
-                    "Received handoff: assumed authority of agent {}",
-                    incoming_agent.id
-                );
-                local_agents.push(incoming_agent);
-            }
+        tick_int.tick().await;
+
+        // Process all incoming handoff packets
+        while let Ok(incoming_agent) = handoff_rx.try_recv() {
+            println!("Received handoff packet for agent {}", incoming_agent.id);
+            local_agents.push(incoming_agent);
         }
 
         // simulate local agents and check boundaries
+        let mut out_of_bounds_agents: Vec<Agent> = Vec::new();
         local_agents.retain_mut(|agent| {
             // apply velocity
             agent.x += agent.velocity_x;
@@ -94,14 +111,7 @@ fn main() {
             );
 
             if agent.x > config.boundary_max && config.name == "Node A" {
-                println!(
-                    "Initiated handoff: agent {} exceeded boundary; transferring to {}",
-                    agent.id, config.neighbour_address
-                );
-                let _ = socket.send_to(
-                    serde_json::to_vec(&agent).unwrap().as_slice(),
-                    &config.neighbour_address,
-                );
+                out_of_bounds_agents.push(agent.clone());
                 return false;
             } else if agent.x > config.boundary_max {
                 println!("Agent {} exceeded boundary", agent.id);
@@ -110,6 +120,15 @@ fn main() {
             true
         });
 
-        thread::sleep(Duration::from_secs(1));
+        for agent in out_of_bounds_agents {
+            println!("Initiated handoff for agent {}", agent.id);
+            socket
+                .send_to(
+                    serde_json::to_vec(&agent).unwrap().as_slice(),
+                    &config.neighbour_address,
+                )
+                .await
+                .expect("Failed to send handoff packet");
+        }
     }
 }
