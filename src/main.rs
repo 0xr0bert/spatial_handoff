@@ -114,7 +114,17 @@ async fn main() {
                 out_of_bounds_agents.push(agent.clone());
                 return false;
             } else if agent.x > config.boundary_max {
-                println!("Agent {} exceeded boundary", agent.id);
+                println!("Agent {} exceeded world, back to beginning", agent.id);
+                agent.x = 0.0f64;
+                out_of_bounds_agents.push(agent.clone());
+                return false;
+            } else if agent.x < config.boundary_min && config.name == "Node B" {
+                out_of_bounds_agents.push(agent.clone());
+                return false;
+            } else if agent.x < config.boundary_min {
+                println!("Agent {} exceeded world, back to end", agent.id);
+                agent.x = 100.0f64;
+                out_of_bounds_agents.push(agent.clone());
                 return false;
             }
             true
